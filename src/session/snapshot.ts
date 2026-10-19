@@ -27,7 +27,7 @@ export interface StoredEvent {
 }
 
 export interface BuildSnapshotOpts {
-  maxBytes?: number;      // KEPT for backward compat but IGNORED
+  maxBytes?: number;      // When set, output is capped to this many chars (lazy-load pointers preserved)
   compactCount?: number;
   searchTool?: string;    // platform-specific tool name, default "ctx_search"
 }
@@ -458,6 +458,52 @@ function buildRecentMessagesSection(userPromptEvents: StoredEvent[]): string {
   ].join("\n");
 }
 
+/**
+ * Cap the assembled snapshot XML to maxBytes chars.
+ *
+ * Why: the snapshot is injected into the LLM systemPrompt verbatim, so an
+ * uncapped session (800k+ chars) overflows the first turn ("prompt too
+ * large"). The cap keeps the head (identity + how_to_search) and the closing
+ * tail intact, and preserves each kept section's tail — where the lazy-load
+ * ctx_search pointer lives — so the full data stays retrievable from
+ * SessionDB on demand.
+ */
+function capToBudget(xml: string, maxBytes: number, searchTool: string): string {
+  if (maxBytes <= 0) return "";
+  if (xml.length <= maxBytes) return xml;
+
+  const HEAD = Math.min(2800, Math.floor(maxBytes * 0.25));
+  const TAIL = Math.min(1600, Math.floor(maxBytes * 0.15));
+  const SECTION_KEEP = 700;
+
+  const head = xml.slice(0, HEAD);
+  // TAIL=0: slice(-0) would return the whole string, so guard it explicitly.
+  const tail = TAIL > 0 ? xml.slice(-TAIL) : "";
+  const mid = xml.slice(HEAD, xml.length - TAIL);
+  // Split at section boundaries (line start: two spaces + <tag>).
+  const parts = mid.split(/\n(?=  <[a-z_]+)/);
+
+  const picks: string[] = [];
+  let budget = maxBytes - HEAD - TAIL - 260; // 260 = note reserve
+  for (const p of parts) {
+    if (budget <= 0) break;
+    // Keep the section tail = keep the ctx_search lazy-load pointer.
+    const keep = p.length <= SECTION_KEEP ? p : p.slice(-SECTION_KEEP);
+    picks.push(keep);
+    budget -= keep.length + 1;
+  }
+
+  const note =
+    "\n[context-mode] snapshot capped from " + xml.length + " chars to fit maxBytes=" + maxBytes +
+    "; full data lives in SessionDB — retrieve on demand via " + searchTool + "(...).\n";
+
+  let out = head + note + picks.join("\n") + tail;
+  if (out.length > maxBytes) {
+    out = out.slice(0, maxBytes - TAIL) + (TAIL > 0 ? out.slice(-TAIL) : "");
+  }
+  return out;
+}
+
 // ── Main builder ─────────────────────────────────────────────────────────────
 
 /**
@@ -570,8 +616,11 @@ export function buildResumeSnapshot(
   const footer = `</session_resume>`;
 
   const body = sections.join("\n\n");
-  if (body) {
-    return `${header}\n\n${body}\n\n${footer}`;
+  let result = body
+    ? `${header}\n\n${body}\n\n${footer}`
+    : `${header}\n${footer}`;
+  if (opts?.maxBytes !== undefined) {
+    result = capToBudget(result, opts.maxBytes, searchTool);
   }
-  return `${header}\n${footer}`;
+  return result;
 }

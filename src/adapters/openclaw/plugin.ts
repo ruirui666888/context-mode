@@ -49,6 +49,12 @@ import { buildNodeCommand } from "../types.js";
 import { OPENCLAW_TOOL_DEFS } from "./mcp-tools.js";
 import type { OpenClawToolDef } from "./mcp-tools.js";
 
+// Cap the resume snapshot injected into the LLM systemPrompt. Unmeasured
+// sessions grew to 824,170 chars → first-turn systemPrompt 895,171 chars →
+// "prompt too large" (measured 2026-10-19). The cap keeps ctx_search lazy-load
+// pointers so full data stays retrievable from SessionDB.
+const RESUME_SNAPSHOT_MAX_CHARS = 12000;
+
 // ── System-reminder filter (CCv2 — SLICE OClaw-3) ─────────
 // Mirror hooks/userpromptsubmit.mjs:30-33: skip system-generated wrappers
 // so before_model_resolve never inserts spurious user-prompt events.
@@ -736,6 +742,7 @@ export default {
           const freshStats = db.getSessionStats(sid);
           const snapshot = buildResumeSnapshot(allEvents, {
             compactCount: (freshStats?.compact_count ?? 0) + 1,
+            maxBytes: RESUME_SNAPSHOT_MAX_CHARS,
           });
           db.upsertResume(sid, snapshot, allEvents.length);
         } catch {
@@ -870,6 +877,7 @@ export default {
           const freshStats = db.getSessionStats(sid);
           const snapshot = buildResumeSnapshot(allEvents, {
             compactCount: freshStats?.compact_count ?? 0,
+            maxBytes: RESUME_SNAPSHOT_MAX_CHARS,
           });
           db.upsertResume(sid, snapshot, allEvents.length);
         } catch {
